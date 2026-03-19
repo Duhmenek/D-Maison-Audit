@@ -1,77 +1,52 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Parcel, EXPECTED_PARCELS } from '@/app/lib/data';
 import { SyncService } from '@/app/lib/sync-service';
 
-export default function AuditDashboard() {
-  const [spreadsheetData, setSpreadsheetData] = useState<any[]>([]);
+interface AuditMatch {
+  invoiceNumber: string;
+  customerName: string;
+  orNumber: string;
+  status: 'received' | 'missing';
+}
+
+export default function AuditCenter() {
+  const [activeTab, setActiveTab] = useState<'AUTO' | 'MANUAL'>('MANUAL');
+  
+  // --- STATE FOR AUTO AUDIT (Original Feature) ---
   const [auditList, setAuditList] = useState<Parcel[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [debugLog, setDebugLog] = useState<string[]>([]);
 
+  // --- STATE FOR MANUAL ASSISTANT (New Feature) ---
+  const [manifestInput, setManifestInput] = useState('');
+  const [receivingInput, setReceivingInput] = useState('');
+
   const log = (msg: string) => {
-    console.log(`[AUDIT] ${msg}`);
     setDebugLog(prev => [...prev.slice(-4), `${new Date().toLocaleTimeString()}: ${msg}`]);
   };
 
-  // 1. Automatic Spreadsheet Scanning Logic
+  // 1. AUTO AUDIT: Spreadsheet Logic
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    log(`File detected: ${file.name} (${file.size} bytes)`);
-
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
-        log("Reading file contents...");
         const bstr = evt.target?.result;
         const wb = XLSX.read(bstr, { type: 'binary' });
-        
-        log(`Sheet found: ${wb.SheetNames[0]}`);
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
+        const ws = wb.Sheets[wb.SheetNames[0]];
         const data: any[] = XLSX.utils.sheet_to_json(ws);
         
-        if (!data || data.length === 0) {
-          log("ERROR: Spreadsheet is empty.");
-          alert("The spreadsheet appears to be empty.");
-          return;
-        }
-
-        log(`Parsed ${data.length} rows. Checking headers...`);
-        const firstRow = data[0];
-        log(`Headers found: ${Object.keys(firstRow).join(', ')}`);
-
-        setSpreadsheetData(data);
-        
-        // Extract Invoice Numbers with expanded matching
         const extractedInvoices = data.map((row: any) => {
           const keys = Object.keys(row);
-          // 1. Try to find a matching header
-          let invoiceKey = keys.find(k => 
-            ['invoice_no', 'invoice', 'invoice number', 'tracking', 'tracking_number', 'waybill', 'waybill number', 'id', 'bill_no', 'no', 'reference', 'order id', 'order_id']
-            .includes(k.toLowerCase().trim())
-          );
-          
-          // 2. Fallback: If no match, just use the VERY FIRST column of the sheet
-          if (!invoiceKey && keys.length > 0) {
-            invoiceKey = keys[0];
-          }
-          
+          let invoiceKey = keys.find(k => ['invoice_no', 'invoice', 'tracking', 'order_id'].includes(k.toLowerCase().trim()));
+          if (!invoiceKey && keys.length > 0) invoiceKey = keys[0];
           return invoiceKey ? String(row[invoiceKey]).trim() : '';
         }).filter(id => id !== '');
-
-        if (extractedInvoices.length === 0) {
-          log("ERROR: No data found in the spreadsheet columns.");
-          alert("Could not find any data in your spreadsheet. Please ensure the first column contains your Invoice Numbers.");
-          return;
-        }
-
-        log(`SUCCESS: Found "${Object.keys(data[0])[0]}" as the primary column. Extracted ${extractedInvoices.length} IDs.`);
 
         const newAuditList = extractedInvoices.map(invoiceNo => {
           const existing = EXPECTED_PARCELS.find(p => p.trackingNumber === invoiceNo);
@@ -84,168 +59,222 @@ export default function AuditDashboard() {
         });
 
         setAuditList(newAuditList);
-        log("SUCCESS: Audit list populated.");
+        log(`Imported ${newAuditList.length} parcels from spreadsheet.`);
       } catch (error: any) {
-        log(`FATAL ERROR: ${error.message}`);
-        alert("Failed to read the file. See debug log below.");
+        log(`Error: ${error.message}`);
       }
     };
-    reader.onerror = () => log("FileReader error occurred.");
     reader.readAsBinaryString(file);
   };
 
-  // 2. Bulk Status Checker (J&T Sync)
   const refreshAllStatuses = async () => {
     setIsSyncing(true);
     const updatedList = [...auditList];
-    
     for (let i = 0; i < updatedList.length; i++) {
       const result = await SyncService.syncParcel(updatedList[i].trackingNumber);
       if (result) updatedList[i] = { ...result };
     }
-    
     setAuditList(updatedList);
     setIsSyncing(false);
+    log("Status synchronization complete.");
   };
 
-  const stats = {
-    total: auditList.length,
-    pickedUp: auditList.filter(p => p.status === 'OUT_FOR_DELIVERY' || p.status === 'DELIVERED').length,
-    missing: auditList.filter(p => p.status === 'IN_BUILDING').length
-  };
+  // 2. MANUAL ASSISTANT: Reconciliation Logic
+  const manualReconciliation = useMemo(() => {
+    const linesA = manifestInput.split('\n').filter(l => l.trim() !== '');
+    const manifestData = linesA.map(line => {
+      const parts = line.split(/[\t,]/);
+      const invoice = parts[0]?.trim();
+      let name = parts[1]?.trim();
+      if (invoice && !name) {
+        const found = EXPECTED_PARCELS.find(p => p.trackingNumber === invoice);
+        name = found ? found.recipient : 'Unknown Client';
+      }
+      return { invoice, name: name || 'Unknown Client' };
+    });
 
-  const filteredList = auditList.filter(p => 
-    p.trackingNumber.includes(searchTerm) || p.recipient.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+    const linesB = receivingInput.split('\n').filter(l => l.trim() !== '');
+    const receivingData = linesB.map(line => {
+      const parts = line.split(/[\t,]/);
+      return { invoice: parts[0]?.trim(), orNumber: parts[1]?.trim() || 'Pending...' };
+    });
+
+    const matched: AuditMatch[] = [];
+    const missing: AuditMatch[] = [];
+
+    manifestData.forEach(m => {
+      if (!m.invoice) return;
+      const recv = receivingData.find(r => r.invoice === m.invoice);
+      if (recv) {
+        matched.push({ invoiceNumber: m.invoice, customerName: m.name, orNumber: recv.orNumber, status: 'received' });
+      } else {
+        missing.push({ invoiceNumber: m.invoice, customerName: m.name, orNumber: '-', status: 'missing' });
+      }
+    });
+
+    return { matched, missing, prepared: manifestData.length, scanned: receivingData.length };
+  }, [manifestInput, receivingInput]);
 
   return (
-    <main className="min-h-screen bg-slate-50 p-8 font-sans">
+    <main className="min-h-screen bg-[#F8FAFC] p-6 md:p-10 font-sans">
       <div className="max-w-6xl mx-auto space-y-8">
         
-        {/* Header & Stats Dashboard */}
-        <div className="flex justify-between items-end">
+        {/* Header */}
+        <div className="flex justify-between items-center border-b border-slate-200 pb-6">
           <div>
-            <h1 className="text-4xl font-black text-slate-900 tracking-tighter italic">RECONCILIATION HUB</h1>
-            <p className="text-slate-500 font-bold uppercase text-xs tracking-widest mt-1">J&T Express & Spreadsheet Audit</p>
-          </div>
-          <div className="flex gap-4">
-            <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 text-center min-w-[120px]">
-              <p className="text-[10px] font-black text-slate-400 uppercase">Total in Sheet</p>
-              <p className="text-2xl font-black text-slate-900">{stats.total}</p>
-            </div>
-            <div className="bg-emerald-500 p-4 rounded-2xl shadow-lg shadow-emerald-100 text-center min-w-[120px]">
-              <p className="text-[10px] font-black text-emerald-100 uppercase">Picked Up</p>
-              <p className="text-2xl font-black text-white">{stats.pickedUp}</p>
-            </div>
-            <div className="bg-rose-500 p-4 rounded-2xl shadow-lg shadow-rose-100 text-center min-w-[120px]">
-              <p className="text-[10px] font-black text-rose-100 uppercase">Missing</p>
-              <p className="text-2xl font-black text-white">{stats.missing}</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Action Bar */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="md:col-span-2 relative">
-            <input 
-              type="text" 
-              placeholder="Search Invoice or Recipient..." 
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-12 pr-4 py-4 bg-white border-2 border-slate-200 rounded-2xl focus:border-slate-900 focus:outline-none font-bold"
-            />
-            <span className="absolute left-4 top-4 text-slate-400">🔍</span>
+            <h1 className="text-3xl font-black text-slate-900 tracking-tighter uppercase italic">
+              D-Maison <span className="text-accent">Audit Center</span>
+            </h1>
+            <p className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.3em] mt-1">Multi-Channel Reconciliation Hub</p>
           </div>
           
-          <label className="cursor-pointer bg-slate-900 text-white py-4 px-6 rounded-2xl font-black flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-xl shadow-slate-200">
-            <span>📁 Upload Spreadsheet</span>
-            <input type="file" className="hidden" accept=".xlsx, .csv" onChange={handleFileUpload} />
-          </label>
+          {/* Tab Switcher */}
+          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200">
+            <button 
+              onClick={() => setActiveTab('MANUAL')}
+              className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'MANUAL' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400'}`}
+            >
+              Manual Assistant
+            </button>
+            <button 
+              onClick={() => setActiveTab('AUTO')}
+              className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === 'AUTO' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400'}`}
+            >
+              Excel Auto-Audit
+            </button>
+          </div>
         </div>
 
-        <button 
-          onClick={refreshAllStatuses}
-          disabled={isSyncing || auditList.length === 0}
-          className={`w-full py-4 rounded-2xl font-black text-lg transition-all border-4 ${
-            isSyncing ? 'bg-slate-100 text-slate-400 border-slate-100' : 'bg-white border-slate-900 text-slate-900 hover:bg-slate-900 hover:text-white'
-          }`}
-        >
-          {isSyncing ? '🔄 RECONCILING WITH J&T ECOSYSTEM...' : '⚡ REFRESH ALL STATUSES'}
-        </button>
+        {activeTab === 'MANUAL' ? (
+          /* --- LOGISTICS AUDIT ASSISTANT TAB --- */
+          <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <StatCard label="Prepared" value={manualReconciliation.prepared} subtext="Manifest Total" />
+              <StatCard label="Scanned" value={manualReconciliation.scanned} subtext="Log Total" />
+              <StatCard label="Discrepancies" value={manualReconciliation.missing.length} subtext="Missing Parcels" color={manualReconciliation.missing.length > 0 ? 'rose' : 'emerald'} />
+            </div>
 
-        {/* Live Tally Section */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          
-          {/* LIST A: PENDING (MISSING) */}
-          <div className="space-y-4">
-            <h2 className="text-sm font-black text-rose-500 uppercase tracking-widest flex items-center gap-2">
-              <span className="w-2 h-2 bg-rose-500 rounded-full animate-pulse"></span>
-              List A: Pending / Not Picked Up
-            </h2>
-            <div className="space-y-3">
-              {filteredList.filter(p => p.status === 'IN_BUILDING').map(p => (
-                <div key={p.trackingNumber} className="bg-white p-4 rounded-xl border-l-8 border-rose-500 shadow-sm flex justify-between items-center">
-                  <div>
-                    <p className="font-black text-slate-900">#{p.trackingNumber}</p>
-                    <p className="text-xs text-slate-500 font-bold uppercase">{p.recipient}</p>
-                  </div>
-                  <span className="bg-rose-100 text-rose-600 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-tighter">Missing At J&T</span>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Input A: Outgoing Manifest</label>
+                <textarea 
+                  value={manifestInput}
+                  onChange={(e) => setManifestInput(e.target.value)}
+                  placeholder="Paste Invoice numbers (+ Names)..."
+                  className="w-full h-48 p-4 bg-white border-2 border-slate-100 rounded-2xl focus:border-accent focus:outline-none font-mono text-xs shadow-inner"
+                />
+              </div>
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Input B: Receiving Log</label>
+                <textarea 
+                  value={receivingInput}
+                  onChange={(e) => setReceivingInput(e.target.value)}
+                  placeholder="Paste Invoice numbers + OR numbers..."
+                  className="w-full h-48 p-4 bg-white border-2 border-slate-100 rounded-2xl focus:border-accent focus:outline-none font-mono text-xs shadow-inner"
+                />
+              </div>
+            </div>
+
+            <section className="space-y-4">
+              <h2 className="text-xs font-black text-slate-900 uppercase tracking-[0.2em] flex items-center gap-2">
+                <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></span>
+                Verified Matches
+              </h2>
+              <div className="bg-white rounded-2xl border border-slate-100 overflow-hidden">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-slate-50 text-slate-400 uppercase font-black tracking-tighter">
+                    <tr>
+                      <th className="px-6 py-4">Invoice</th>
+                      <th className="px-6 py-4">Customer</th>
+                      <th className="px-6 py-4">OR Number</th>
+                      <th className="px-6 py-4">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {manualReconciliation.matched.map((item, idx) => (
+                      <tr key={idx}>
+                        <td className="px-6 py-4 font-bold">#{item.invoiceNumber}</td>
+                        <td className="px-6 py-4"><span className="bg-emerald-50 text-emerald-700 px-2 py-1 rounded font-bold">{item.customerName}</span></td>
+                        <td className="px-6 py-4 font-mono text-accent font-bold">{item.orNumber}</td>
+                        <td className="px-6 py-4 text-emerald-500 font-black">RECEIVED</td>
+                      </tr>
+                    ))}
+                    {manualReconciliation.matched.length === 0 && (
+                      <tr><td colSpan={4} className="px-6 py-8 text-center text-slate-300 italic">No data matched yet.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        ) : (
+          /* --- EXCEL AUTO-AUDIT TAB --- */
+          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-500">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <label className="cursor-pointer bg-slate-900 text-white py-6 rounded-2xl font-black text-center hover:bg-slate-800 transition-all shadow-xl">
+                <span>📁 Upload Master Spreadsheet</span>
+                <input type="file" className="hidden" accept=".xlsx, .csv" onChange={handleFileUpload} />
+              </label>
+              <button 
+                onClick={refreshAllStatuses}
+                disabled={isSyncing || auditList.length === 0}
+                className="bg-white border-2 border-slate-900 py-6 rounded-2xl font-black hover:bg-slate-900 hover:text-white transition-all"
+              >
+                {isSyncing ? '🔄 Syncing with Courier...' : '⚡ Bulk Status Sync'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+              <div className="space-y-4">
+                <h3 className="text-[10px] font-black text-rose-500 uppercase tracking-widest">Pending At Hub</h3>
+                <div className="space-y-2">
+                  {auditList.filter(p => p.status === 'IN_BUILDING').map(p => (
+                    <div key={p.trackingNumber} className="bg-white p-4 rounded-xl border-l-4 border-rose-500 shadow-sm flex justify-between items-center">
+                      <p className="font-bold text-xs text-slate-900">#{p.trackingNumber}</p>
+                      <p className="text-[10px] text-slate-400 font-bold uppercase">{p.recipient}</p>
+                    </div>
+                  ))}
                 </div>
+              </div>
+              <div className="space-y-4">
+                <h3 className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Courier Picked Up</h3>
+                <div className="space-y-2">
+                  {auditList.filter(p => p.status !== 'IN_BUILDING').map(p => (
+                    <div key={p.trackingNumber} className="bg-white p-4 rounded-xl border-l-4 border-emerald-500 shadow-sm flex justify-between items-center">
+                      <p className="font-bold text-xs text-slate-900">#{p.trackingNumber}</p>
+                      <p className="text-[10px] text-emerald-600 font-bold uppercase">Ready for Delivery</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Debug Monitor */}
+            <div className="bg-slate-900 p-6 rounded-2xl font-mono text-[10px]">
+              <p className="text-accent mb-2 uppercase font-black">System Terminal</p>
+              {debugLog.map((l, i) => (
+                <p key={i} className="text-slate-400"><span className="text-emerald-500 mr-2">➜</span> {l}</p>
               ))}
             </div>
-          </div>
-
-          {/* LIST B: COMPLETED (PICKED UP) */}
-          <div className="space-y-4">
-            <h2 className="text-sm font-black text-emerald-500 uppercase tracking-widest flex items-center gap-2">
-              <span className="w-2 h-2 bg-emerald-500 rounded-full"></span>
-              List B: Verified & Picked Up
-            </h2>
-            <div className="space-y-3">
-              {filteredList.filter(p => p.status !== 'IN_BUILDING').map(p => (
-                <div key={p.trackingNumber} className="bg-white p-4 rounded-xl border-l-8 border-emerald-500 shadow-sm flex justify-between items-center">
-                  <div>
-                    <p className="font-black text-slate-900">#{p.trackingNumber}</p>
-                    <p className="text-xs text-slate-500 font-bold uppercase">{p.recipient}</p>
-                  </div>
-                  <div className="text-right">
-                    <span className="bg-emerald-100 text-emerald-600 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-tighter block mb-1">Tally Confirmed</span>
-                    <p className="text-[9px] text-slate-400 font-bold uppercase">{p.jtWaybillNumber}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-        </div>
-
-        {/* DEBUG MONITOR */}
-        <div className="mt-12 p-6 bg-slate-900 rounded-2xl border-4 border-slate-800">
-          <h3 className="text-rose-500 font-black text-xs uppercase tracking-widest mb-4 flex items-center gap-2">
-            <span className="w-2 h-2 bg-rose-500 rounded-full animate-pulse"></span>
-            System Debug Monitor (Real-Time)
-          </h3>
-          <div className="space-y-2 font-mono text-xs">
-            {debugLog.length === 0 ? (
-              <p className="text-slate-600 italic">No activity detected. Waiting for file upload...</p>
-            ) : (
-              debugLog.map((l, i) => (
-                <p key={i} className="text-slate-300">
-                  <span className="text-emerald-500 mr-2">➜</span> {l}
-                </p>
-              ))
-            )}
-          </div>
-        </div>
-
-        {auditList.length === 0 && (
-          <div className="py-20 text-center border-4 border-dashed border-slate-200 rounded-3xl">
-            <p className="text-slate-400 font-black text-xl italic uppercase tracking-tighter">Drag and drop your spreadsheet to begin audit</p>
-            <p className="text-slate-300 text-xs font-bold mt-2">SUPPORTED FORMATS: .XLSX, .CSV (Expected Column: "invoice_no")</p>
           </div>
         )}
 
       </div>
     </main>
+  );
+}
+
+function StatCard({ label, value, subtext, color = 'slate' }: { label: string; value: string | number; subtext: string; color?: 'slate' | 'emerald' | 'rose' }) {
+  const styles = {
+    slate: 'bg-white text-slate-900 border-slate-100',
+    emerald: 'bg-emerald-50 text-emerald-900 border-emerald-100',
+    rose: 'bg-rose-50 text-rose-900 border-rose-100'
+  };
+  return (
+    <div className={`p-6 rounded-2xl border-2 shadow-sm ${styles[color]} transition-all`}>
+      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">{label}</p>
+      <p className="text-2xl font-black italic tracking-tighter">{value}</p>
+      <p className="text-[8px] font-bold uppercase text-slate-300 mt-1">{subtext}</p>
+    </div>
   );
 }
