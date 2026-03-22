@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import pdf from 'pdf-parse';
+const pdf = require('pdf-parse');
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import { BankStatementParser } from '@/app/lib/bank-parser';
