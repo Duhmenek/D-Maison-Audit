@@ -13,7 +13,8 @@ export async function POST(req: Request) {
     }
 
     // Dynamic import to avoid build-time ESM issues with pdf-parse
-    const pdf = (await import('pdf-parse')).default;
+    const pdfParse = await import('pdf-parse');
+    const pdf = pdfParse.default || pdfParse;
 
     const buffer = Buffer.from(await file.arrayBuffer());
 

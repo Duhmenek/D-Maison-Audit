@@ -50,11 +50,11 @@ export interface JntVerificationLog {
   sync_status: number;
 }
 
-const isVercel = process.env.VERCEL === '1';
+const isVercel = process.env.VERCEL === '1' && !!supabase;
 
 export const dbService = {
   getAllInvoices: async (): Promise<InvoiceRecord[]> => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       const { data, error } = await supabase.from('invoices').select('*').order('synced_at', { ascending: false });
       if (error) throw error;
       return data as InvoiceRecord[];
@@ -63,7 +63,7 @@ export const dbService = {
   },
 
   upsertInvoice: async (invoice: Partial<InvoiceRecord>) => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       const { data: existing } = await supabase.from('invoices').select('*').eq('invoice_number', invoice.invoice_number).single();
       const isDuplicate = existing ? 1 : 0;
       const { error } = await supabase.from('invoices').upsert({
@@ -90,7 +90,7 @@ export const dbService = {
   },
 
   updateScanStatus: async (invoiceNumber: string, status: string, scanTime: string) => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       const { error } = await supabase.from('invoices').update({ status, scanned_at: scanTime }).eq('invoice_number', invoiceNumber);
       if (error) throw error;
       return;
@@ -104,7 +104,7 @@ export const dbService = {
   },
 
   addVerificationLog: async (log: Omit<JntVerificationLog, 'log_id' | 'timestamp' | 'sync_status'>) => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       const { error } = await supabase.from('jnt_verification_logs').insert({
         staff_name: log.staff_name,
         date_processed: log.date_processed,
@@ -121,7 +121,7 @@ export const dbService = {
   },
 
   getVerificationLogs: async (): Promise<JntVerificationLog[]> => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       const { data, error } = await supabase.from('jnt_verification_logs').select('*').order('timestamp', { ascending: false });
       if (error) throw error;
       return data as JntVerificationLog[];
@@ -130,7 +130,7 @@ export const dbService = {
   },
 
   clearAll: async () => {
-    if (isVercel) {
+    if (isVercel && supabase) {
       await supabase.from('jnt_verification_logs').delete().neq('log_id', 0);
       await supabase.from('invoices').delete().neq('invoice_number', '');
       return;
